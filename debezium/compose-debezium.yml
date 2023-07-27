@@ -1,0 +1,126 @@
+version: "3.8"
+services:
+  zookeeper:
+    image: zookeeper:3.8.1
+    networks:
+      - service-network
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ALLOW_ANONYMOUS_LOGIN: yes
+#      ZOO_CFG_EXTRA: "authProvider.sasl=org.apache.zookeeper.server.auth.SASLAuthenticationProvider"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+      - 2181:2181
+      - 20080:8080
+    restart: unless-stopped
+
+  kafka:
+    image: bitnami/kafka:3.4.1
+    networks:
+      - service-network
+    environment:
+#      BITNAMI_DEBUG: yes
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENERS: INTERNAL://:9092,EXTERNAL://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://127.0.0.2:9093
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:SASL_PLAINTEXT
+      KAFKA_ENABLE_KRAFT: no
+      KAFKA_CLIENT_USERS: kafka_cluster
+      KAFKA_CLIENT_PASSWORDS: exchange
+#      KAFKA_ZOOKEEPER_PROTOCOL: SASL
+#      KAFKA_ZOOKEEPER_USER: kafka_cluster
+#      KAFKA_ZOOKEEPER_PASSWORD: exchange
+      KAFKA_SASL_ENABLED_MECHANISMS: SCRAM-SHA-256,SCRAM-SHA-512
+#      KAFKA_CFG_SASL_MECHANISM_INTER_BROKER_PROTOCOL: PLAIN
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: INTERNAL
+      ALLOW_PLAINTEXT_LISTENER: yes
+#      KAFKA_KRAFT_CLUSTER_ID: 1
+    depends_on: [ zookeeper ]
+    ports:
+      - 9093:9093
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - ./kafka.jaas:/opt/bitnami/kafka/config/kafka_jaas.conf:ro
+    restart: unless-stopped
+
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    networks:
+      - service-network
+    environment:
+      SCHEMA_REGISTRY_LISTENERS: http://schema-registry:8081,http://localhost:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+    depends_on: [ zookeeper, kafka ]
+    ports:
+      - 8081:8081
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+
+  debezium:
+    image: braginxv/debezium-confluent-avro:2.3
+    networks:
+      - service-network
+    environment:
+      GROUP_ID: 1
+      BOOTSTRAP_SERVERS: kafka:9092
+      CONFIG_STORAGE_TOPIC: connect_configs
+      OFFSET_STORAGE_TOPIC: connect_offsets
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: testpasswd
+      KEY_CONVERTER: io.confluent.connect.avro.AvroConverter
+      VALUE_CONVERTER: io.confluent.connect.avro.AvroConverter
+      CONNECT_KEY_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      CONNECT_VALUE_CONVERTER_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    depends_on: [ kafka, schema-registry ]
+    ports:
+      - 8083:8083
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+    restart: unless-stopped
+
+  debezium-connectors:
+    image: curlimages/curl:8.1.2
+    networks:
+      - service-network
+    depends_on: [ debezium ]
+    command:
+      - /bin/sh
+      - -c
+      - |
+          counter=1
+          sleep 30
+          echo "Trying to create debezium Postgres connector, attempt $$counter ..."
+          until curl -i -X POST -H "Accept:application/json" -H "Content-Type:application/json" debezium:8083/connectors/ --fail-with-body -d '
+            {
+              "name": "pg-connector",
+              "config": {
+                "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+                "plugin.name": "pgoutput",
+                "database.hostname": "ff-test-db",
+                "tasks.max": "1",
+                "database.port": "5432",
+                "database.user": "postgres",
+                "database.password": "testpasswd",
+                "database.dbname" : "main",
+                "topic.prefix": "my.services",
+                "table.include.list": "public.(.*)",
+                "slot.name": "my_debezium",
+                "publication.name": "my_publication"
+              }
+            }
+            '
+          do
+            counter=$((counter + 1))
+            sleep 5
+            echo "Trying to create debezium connector to Postgres, attempt $$counter ..."
+          done
+
+          echo 'Postgres connector hass been registered to Debezium connect'
+
+networks:
+  service-network:
+    name: my-network
+    external: true
